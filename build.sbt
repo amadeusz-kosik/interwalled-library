@@ -1,100 +1,36 @@
-ThisBuild / scalaVersion := "2.13.18"
-
-ThisBuild / organization := "me.kosik.interwalled"
+ThisBuild / organization := "me.kosik"
 ThisBuild / version := "0.1.0-SNAPSHOT"
 
-val defaultScalacOptions = Seq("-deprecation", "-unchecked", "-Xlint", "-Xdisable-assertions")
+ThisBuild / scalacOptions ++= Seq("-deprecation", "-unchecked", "-Xlint", "-Xdisable-assertions")
+ThisBuild / scalaVersion := "2.13.18"
 
-// Deduplication (assemblyMergeStrategy) for sbt-assembly
-val sparkJobAssemblyMergeStrategy: String => sbtassembly.MergeStrategy = {
-  // Do not erase log4j files
-  case "plugin.properties" | "log4j.properties" =>
-    MergeStrategy.concat
+ThisBuild / Test / parallelExecution := false
 
-  // Otherwise it will fail with "Failed to find the data source: parquet."
-  case PathList("META-INF", "services",  _*) =>
-    MergeStrategy.concat
-
-  case PathList("META-INF", xs @ _*) =>
-    MergeStrategy.discard
-
-  case x =>
-    MergeStrategy.first
-}
-
-// Libraries' versions
-val SparkVersion            = "3.5.3"
-val SparkTestingBaseVersion = f"${SparkVersion}_2.0.1"
-
-// Sequila has support for Spark up to 3.4.3
-val SequilaSparkVersion = "3.4.1"
-val SequilaSparkTestingBaseVersion = f"${SequilaSparkVersion}_1.4.4"
-
-
-lazy val `ailist-core` = (project in file("ailist-core"))
-  .settings(
-    name := "ailist-core",
-    scalacOptions ++= defaultScalacOptions,
-    libraryDependencies ++= Seq(
-      "org.scalatest"   %% "scalatest" % "3.2.20" % Test,
-    )
-  )
-
-//lazy val ailistCoreBenchmark = (project in file("ailist-core-benchmark"))
-//  .settings(
-//    name := "ailist-core-benchmark"
-//  )
-//  .dependsOn(`ailist-core`)
-//  .enablePlugins(JmhPlugin)
-
-//lazy val ailistSpark = (project in file("ailist-spark"))
-//  .settings(
-//    name := "ailist-spark"
-//  )
-//  .dependsOn(`ailist-core`)
-
-//lazy val benchmarkCommon = (project in file("benchmarks/common"))
-//  .settings(
-//    name := "benchmark-common",
-//    scalacOptions ++= DefaultScalacOptions
-//  )
+//// Deduplication (assemblyMergeStrategy) for sbt-assembly
+//val sparkJobAssemblyMergeStrategy: String => sbtassembly.MergeStrategy = {
+//  // Do not erase log4j files
+//  case "plugin.properties" | "log4j.properties" =>
+//    MergeStrategy.concat
 //
-//lazy val benchmarkSequila = (project in file("benchmarks/sequila"))
-//  .settings(
-//    name := "benchmark-sequila",
-//    scalacOptions ++= DefaultScalacOptions,
-//    assembly / assemblyJarName := "benchmark-sequila.jar",
-//    assembly / mainClass := Some("me.kosik.interwalled.benchmark.sequila.Main"),
-//    assembly / assemblyMergeStrategy := sparkJobAssemblyMergeStrategy
-//  )
-//  .dependsOn(benchmarkCommon)
+//  // Otherwise it will fail with "Failed to find the data source: parquet."
+//  case PathList("META-INF", "services",  _*) =>
+//    MergeStrategy.concat
 //
-//lazy val benchmarkInterwalled = (project in file("benchmarks/interwalled"))
-//  .settings(
-//    name := "benchmark-interwalled",
-//    scalacOptions ++= DefaultScalacOptions,
-//    assembly / assemblyJarName := "benchmark-interwalled.jar",
-//    assembly / mainClass := Some("me.kosik.interwalled.benchmark.interwalled.Main"),
-//    assembly / assemblyMergeStrategy := sparkJobAssemblyMergeStrategy
-//  )
-//  .dependsOn(benchmarkCommon, spark)
+//  case PathList("META-INF", xs @ _*) =>
+//    MergeStrategy.discard
+//
+//  case x =>
+//    MergeStrategy.first
+//}
+
 
 lazy val root = (project in file("."))
-  .aggregate(`ailist-core`)
   .settings(name := "interwalled")
 
-//ailistSpark / Test / parallelExecution := false
-//ailistSpark / libraryDependencies += "org.apache.spark"  %% "spark-core"              % SparkVersion              % Provided
-//ailistSpark / libraryDependencies += "org.apache.spark"  %% "spark-sql"               % SparkVersion              % Provided
-//ailistSpark / libraryDependencies += "com.holdenkarau"   %% "spark-testing-base"      % SparkTestingBaseVersion   % Test
 
-//benchmarkInterwalled / Test / parallelExecution := false
-//benchmarkInterwalled / libraryDependencies += "org.apache.spark"      %% "spark-core"           % SparkVersion                    % Provided
-//benchmarkInterwalled / libraryDependencies += "org.apache.spark"      %% "spark-sql"            % SparkVersion                    % Provided
-//benchmarkInterwalled / libraryDependencies += "com.holdenkarau"       %% "spark-testing-base"   % SparkTestingBaseVersion         % Test
-//
-//benchmarkSequila / Test / parallelExecution := false
-//benchmarkSequila / libraryDependencies += "org.apache.spark"          %% "spark-core"           % SequilaSparkVersion             % Provided
-//benchmarkSequila / libraryDependencies += "org.apache.spark"          %% "spark-sql"            % SequilaSparkVersion             % Provided
-//benchmarkSequila / libraryDependencies += "com.holdenkarau"           %% "spark-testing-base"   % SequilaSparkTestingBaseVersion  % Test
-//benchmarkSequila / libraryDependencies += "org.biodatageeks"          %% "sequila"              % "local"
+val ScalaTestVersion = "3.2.20"
+val SparkVersion = "4.1.1"
+
+ThisBuild / libraryDependencies += "org.scalatest"      %% "scalatest"    % ScalaTestVersion
+ThisBuild / libraryDependencies += "org.apache.spark"   %% "spark-core"   % SparkVersion      % Provided
+ThisBuild / libraryDependencies += "org.apache.spark"   %% "spark-sql"    % SparkVersion      % Provided
