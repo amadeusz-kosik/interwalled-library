@@ -7,12 +7,16 @@ import scala.collection.mutable.ArrayBuffer
 object AIListBuilder {
 
   def build(configuration: Configuration, sourceIntervals: Iterator[Interval]): Array[AIList] = {
+    build(configuration, sourceIntervals.toArray)
+  }
+
+  def build(configuration: Configuration, sourceIntervals: Array[Interval]): Array[AIList] = {
     assert(configuration.intervalsCountToCheckLookahead >= configuration.intervalsCountToTriggerExtraction)
     assert(configuration.intervalsCountToCheckLookahead > 0)
     assert(configuration.maximumComponentSize > 0)
 
     var intervals = mutable.ArrayDeque.from(
-      sourceIntervals.toArray.sorted(Ordering.by[Interval, (Long, Long)](i => (i.from, i.to)))
+      sourceIntervals.sorted(Ordering.by[Interval, (Long, Long)](i => (i.from, i.to)))
     )
     val results = ArrayBuffer[AIList]()
 
