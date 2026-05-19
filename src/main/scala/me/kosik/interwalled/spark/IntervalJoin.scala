@@ -1,10 +1,9 @@
 package me.kosik.interwalled.spark
 
 import me.kosik.interwalled.ailist.{AIListBuilder, Configuration, Interval}
-import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{DataFrame, Row, functions => F}
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.types.{DataTypes, StructField, StructType}
+import org.apache.spark.sql.{DataFrame, functions => F}
 import org.apache.spark.storage.StorageLevel
 
 
@@ -30,9 +29,22 @@ object IntervalJoin {
      */
     thresholdGroupSplit: Long = 1_000_000
   )
+
+  val outputSparkSchema: StructType = StructType(Array(
+    StructField("key", DataTypes.StringType, nullable = false),
+    StructField("lhs", StructType(Array(
+      StructField("from", DataTypes.LongType, nullable = false),
+      StructField("to", DataTypes.LongType, nullable = false)
+    )), nullable = false),
+    StructField("rhs", StructType(Array(
+      StructField("from", DataTypes.LongType, nullable = false),
+      StructField("to", DataTypes.LongType, nullable = false)
+    )), nullable = false)
+  ))
 }
 
 class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializable {
+  import IntervalJoin.outputSparkSchema
 
   // FIXME: this function has no description
   // FIXME: this function needs logging
@@ -67,18 +79,6 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       }
     }
   }
-
-  private val partiallyStructuredOutputSchema = StructType(Array(
-    StructField("key", DataTypes.StringType, nullable = false),
-    StructField("lhs", StructType(Array(
-      StructField("from", DataTypes.LongType, nullable = false),
-      StructField("to",   DataTypes.LongType, nullable = false)
-    )), nullable = false),
-    StructField("rhs", StructType(Array(
-      StructField("from", DataTypes.LongType, nullable = false),
-      StructField("to",   DataTypes.LongType, nullable = false)
-    )), nullable = false)
-  ))
 
   /**
    * Select which side of the join will be converted to AIList (database) and which will be left as is.
@@ -223,7 +223,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
           ).as("rhs")
         )
         .rdd,
-      partiallyStructuredOutputSchema
+      outputSparkSchema
     )
   }
 
