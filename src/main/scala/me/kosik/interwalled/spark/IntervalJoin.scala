@@ -60,11 +60,11 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
 
   // FIXME: this function has no description
   // FIXME: this function needs logging
-  def join(lhs: DataFrame, rhs: DataFrame)(implicit sparkSession: SparkSession): DataFrame = {
+  def join(lhs: DataFrame, rhs: DataFrame)(implicit sparkSession: SparkSession): (String, DataFrame) = {
     import sparkSession.implicits._
 
     val databaseQueryChoice = chooseDatabaseAndQuery(lhs, rhs)
-    val joinedRDD = selectAndRunIntervalJoinStrategy(databaseQueryChoice)
+    val (joinMethod, joinedRDD) = selectAndRunIntervalJoinStrategy(databaseQueryChoice)
 
     val initialDFColumnNames = {
       if (databaseQueryChoice.isSwapped)
@@ -73,7 +73,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
         Array("key", "lhs_from", "lhs_to", "rhs_from", "rhs_to")
     }
 
-    sparkSession.createDataFrame(
+    joinMethod -> sparkSession.createDataFrame(
       joinedRDD
         .toDF(initialDFColumnNames: _*)
         .select(
@@ -109,9 +109,9 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       DatabaseQueryChoice(rhs, rhsSize, lhs, lhsSize, isSwapped = true)
   }
 
-  private def selectAndRunIntervalJoinStrategy(databaseQueryChoice: DatabaseQueryChoice)(implicit sparkSession: SparkSession): JoinedRDD = {
+  private def selectAndRunIntervalJoinStrategy(databaseQueryChoice: DatabaseQueryChoice)(implicit sparkSession: SparkSession): (String, JoinedRDD) = {
     if (databaseQueryChoice.databaseCount <= configuration.thresholdBroadcastJoinRowsCount) {
-      runBroadcastIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
+      "broadcast" -> runBroadcastIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
     } else {
       val keyCounts = databaseQueryChoice.database
         .select("key")
@@ -130,11 +130,11 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
           .toList
 
         if (groupsToSplit.nonEmpty)
-          runRankedIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query, groupsToSplit)
+          "ranked" -> runRankedIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query, groupsToSplit)
         else
-          runStandardIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
+          "standard" -> runStandardIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
       } else {
-        runStandardIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
+        "standard" -> runStandardIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
       }
     }
   }
@@ -186,11 +186,11 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
   private def runRankedIntervalJoin(databaseDF: DataFrame, queryDF: DataFrame, groupsToSplit: List[String])(implicit sparkSession: SparkSession): JoinedRDD = {
     val rankedDatabaseDF = databaseDF
       .withColumn("__rank",
-        F.when(F.col("key").isin(groupsToSplit),
+        F.when(F.col("key").isin(groupsToSplit.toArray: _*),
             F.dense_rank().over(Window.partitionBy("key").orderBy(F.col("from").asc, F.col("to").asc)))
           .otherwise(F.lit(0))
       )
-      .withColumn("__bucket", (F.col("__rank") / F.lit(configuration.thresholdGroupSplit)).cast(DataTypes.LongType))
+      .withColumn("__bucket", (F.col("__rank") / F.lit(configuration.thresholdGroupSplit)).cast(DataTypes.IntegerType))
       .drop("__rank")
       .persist(StorageLevel.MEMORY_AND_DISK)
 

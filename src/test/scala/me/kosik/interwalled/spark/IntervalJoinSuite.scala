@@ -11,7 +11,7 @@ class IntervalJoinSuite extends AnyFunSpec with Matchers with WithDataFrameAsser
 
   val intervalJoinStrategies: Map[String, IntervalJoin.Configuration] = Map(
     "broadcast" -> IntervalJoin.Configuration(1_000_000L, 1_000_000L, 1_000_000L),
-    "ranked"    -> IntervalJoin.Configuration(        0L,        10L, 1_000_000L),
+    "ranked"    -> IntervalJoin.Configuration(        0L, 1_000_000L,        10L),
     "standard"  -> IntervalJoin.Configuration(        0L, 1_000_000L, 1_000_000L)
   )
 
@@ -25,8 +25,9 @@ class IntervalJoinSuite extends AnyFunSpec with Matchers with WithDataFrameAsser
           val rhsDataset = TestDatasets.querySparse(100, 1)
 
           val expectedData = createExpectedDF(lhsDataset, rhsDataset)
-          val actualData = (new IntervalJoin(configuration)).join(lhsDataset, rhsDataset)
+          val (strategy, actualData) = (new IntervalJoin(configuration)).join(lhsDataset, rhsDataset)
 
+          strategy should be (strategyName)
           assertDataFramesEqual(expectedData, actualData)
         }
 
@@ -37,8 +38,9 @@ class IntervalJoinSuite extends AnyFunSpec with Matchers with WithDataFrameAsser
         val rhsDataset = TestDatasets.querySparse(100, 4)
 
         val expectedData = createExpectedDF(lhsDataset, rhsDataset)
-        val actualData = (new IntervalJoin(configuration)).join(lhsDataset, rhsDataset)
+        val (strategy, actualData) = (new IntervalJoin(configuration)).join(lhsDataset, rhsDataset)
 
+        strategy should be (strategyName)
         assertDataFramesEqual(expectedData, actualData)
       }
 
@@ -49,8 +51,9 @@ class IntervalJoinSuite extends AnyFunSpec with Matchers with WithDataFrameAsser
         val rhsDataset = TestDatasets.queryDense(100, 1)
 
         val expectedData = createExpectedDF(lhsDataset, rhsDataset)
-        val actualData = (new IntervalJoin(configuration)).join(lhsDataset, rhsDataset)
+        val (strategy, actualData) = (new IntervalJoin(configuration)).join(lhsDataset, rhsDataset)
 
+        strategy should be (strategyName)
         assertDataFramesEqual(expectedData, actualData)
       }
 
@@ -61,8 +64,9 @@ class IntervalJoinSuite extends AnyFunSpec with Matchers with WithDataFrameAsser
         val rhsDataset = TestDatasets.queryDense(100, 4)
 
         val expectedData = createExpectedDF(lhsDataset, rhsDataset)
-        val actualData = (new IntervalJoin(configuration)).join(lhsDataset, rhsDataset)
+        val (strategy, actualData) = (new IntervalJoin(configuration)).join(lhsDataset, rhsDataset)
 
+        strategy should be (strategyName)
         assertDataFramesEqual(expectedData, actualData)
       }
     }
