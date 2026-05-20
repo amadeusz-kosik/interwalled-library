@@ -1,9 +1,11 @@
 package me.kosik.interwalled.spark
 
-import me.kosik.interwalled.ailist.{AIListBuilder, Configuration, Interval}
+import me.kosik.interwalled.ailist.{AIList, AIListBuilder, Configuration, Interval}
+import me.kosik.interwalled.spark.IntervalJoin.{DatabaseQueryChoice, JoinedRDD}
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.types.{DataTypes, StructField, StructType}
-import org.apache.spark.sql.{DataFrame, functions => F}
+import org.apache.spark.sql.{DataFrame, SparkSession, functions => F}
 import org.apache.spark.storage.StorageLevel
 
 
@@ -30,6 +32,16 @@ object IntervalJoin {
     thresholdGroupSplit: Long = 1_000_000
   )
 
+  case class DatabaseQueryChoice(
+    database: DataFrame,
+    databaseCount: Long,
+    query: DataFrame,
+    queryCount: Long,
+    isSwapped: Boolean
+  )
+
+  type JoinedRDD = RDD[(String, Long, Long, Long, Long)]
+
   val outputSparkSchema: StructType = StructType(Array(
     StructField("key", DataTypes.StringType, nullable = false),
     StructField("lhs", StructType(Array(
@@ -48,19 +60,66 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
 
   // FIXME: this function has no description
   // FIXME: this function needs logging
-  def join(lhs: DataFrame, rhs: DataFrame): DataFrame = {
-    val (databaseSize, databaseDF, querySize, queryDF, isSwapped) = chooseDatabaseAndQuery(lhs, rhs)
+  def join(lhs: DataFrame, rhs: DataFrame)(implicit sparkSession: SparkSession): DataFrame = {
+    import sparkSession.implicits._
 
-    if (databaseSize <= configuration.thresholdBroadcastJoinRowsCount) {
-      runBroadcastIntervalJoin(databaseDF, queryDF)
+    val databaseQueryChoice = chooseDatabaseAndQuery(lhs, rhs)
+    val joinedRDD = selectAndRunIntervalJoinStrategy(databaseQueryChoice)
+
+    val initialDFColumnNames = {
+      if (databaseQueryChoice.isSwapped)
+        Array("key", "rhs_from", "rhs_to", "lhs_from", "lhs_to")
+      else
+        Array("key", "lhs_from", "lhs_to", "rhs_from", "rhs_to")
+    }
+
+    sparkSession.createDataFrame(
+      joinedRDD
+        .toDF(initialDFColumnNames: _*)
+        .select(
+          F.col("key"),
+          F.struct(
+            F.col("lhs_from").as("from"),
+            F.col("lhs_to").as("to"),
+          ).as("lhs"),
+          F.struct(
+            F.col("rhs_from").as("from"),
+            F.col("rhs_to").as("to"),
+          ).as("rhs")
+        )
+        .rdd,
+      outputSparkSchema
+    )
+  }
+
+  /**
+   * Select which side of the join will be converted to AIList (database) and which will be left as is.
+   *  The database is supposed to have less or the same number of rows as the query.
+   * @param lhs left side of the join.
+   * @param rhs right side of the join.
+   * @return tuple of (databaseCount, database, queryCount, query, isSwapped).
+   */
+  private def chooseDatabaseAndQuery(lhs: DataFrame, rhs:DataFrame): DatabaseQueryChoice = {
+    val lhsSize = lhs.count()
+    val rhsSize = rhs.count()
+
+    if(lhsSize <= rhsSize)
+      DatabaseQueryChoice(lhs, lhsSize, rhs, rhsSize, isSwapped = false)
+    else
+      DatabaseQueryChoice(rhs, rhsSize, lhs, lhsSize, isSwapped = true)
+  }
+
+  private def selectAndRunIntervalJoinStrategy(databaseQueryChoice: DatabaseQueryChoice): JoinedRDD = {
+    if (databaseQueryChoice.databaseCount <= configuration.thresholdBroadcastJoinRowsCount) {
+      runBroadcastIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
     } else {
-      val keyCounts = databaseDF
+      val keyCounts = databaseQueryChoice.database
         .select("key")
         .distinct()
         .count()
 
       if (keyCounts <= configuration.thresholdGroupsCount) {
-        val groupsCounts = databaseDF
+        val groupsCounts = databaseQueryChoice.database
           .groupBy("key")
           .count().as("rows_count")
           .collect()
@@ -71,39 +130,60 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
           .toList
 
         if (groupsToSplit.nonEmpty)
-          runRankedIntervalJoin(databaseDF, queryDF, groupsToSplit)
+          runRankedIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query, groupsToSplit)
         else
-          runStandardIntervalJoin(databaseDF, queryDF, isSwapped)
+          runStandardIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
       } else {
-        runStandardIntervalJoin(databaseDF, queryDF, isSwapped)
+        runStandardIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
       }
     }
   }
 
-  /**
-   * Select which side of the join will be converted to AIList (database) and which will be left as is.
-   *  The database is supposed to have less or the same number of rows as the query.
-   * @param lhs left side of the join.
-   * @param rhs right side of the join.
-   * @return tuple of (databaseCount, database, queryCount, query, isSwapped).
-   */
-  private def chooseDatabaseAndQuery(lhs: DataFrame, rhs:DataFrame): (Long, DataFrame, Long, DataFrame, Boolean) = {
-    val lhsSize = lhs.count()
-    val rhsSize = rhs.count()
+  // -------------------------------------------------------------------------------------------------------------------
 
-    if(lhsSize <= rhsSize)
-      (lhsSize, lhs, rhsSize, rhs, false)
-    else
-      (rhsSize, rhs, lhsSize, lhs, true)
+  private def runBroadcastIntervalJoin(database: DataFrame, query: DataFrame): JoinedRDD = {
+    val sparkSession = database.sparkSession
+
+    val databaseCollected = database
+      .select("key", "from", "to")
+      .rdd
+      .groupBy(row => row.getAs[String]("key"))
+      .map { case(key, rows) => key -> rows.map(row => Interval(row.getAs[Long]("from"), row.getAs[Long]("to"))) }
+      .collect()
+
+    val aiLists: Map[String, Array[AIList]] = databaseCollected
+      .map { case (key, intervals) =>
+        val intervalsIterator = intervals.iterator
+        key -> AIListBuilder.build(Configuration.apply(), intervalsIterator)
+      }
+      .toMap
+
+    val aiListsBroadcast = sparkSession.sparkContext.broadcast(aiLists)
+
+    val queryRDD = query
+      .select("key", "from", "to")
+      .rdd
+
+    val joinedRDD = queryRDD
+      .flatMap { row =>
+        val qKey = row.getAs[String]("key")
+        val qFrom = row.getAs[Long]("from")
+        val qTo = row.getAs[Long]("to")
+
+        aiListsBroadcast.value
+          .get(qKey)
+          .map { aiLists =>
+            aiLists
+              .flatMap(_.overlapping(Interval(qFrom, qTo)))
+              .map(dInterval => (qKey, dInterval.from, dInterval.to, qFrom, qTo))
+          }
+          .getOrElse(Array.empty)
+      }
+
+    joinedRDD
   }
 
-  private def runBroadcastIntervalJoin(database: DataFrame, query: DataFrame): DataFrame = {
-
-
-    ???
-  }
-
-  private def runRankedIntervalJoin(databaseDF: DataFrame, queryDF: DataFrame, groupsToSplit: List[String]): DataFrame = {
+  private def runRankedIntervalJoin(databaseDF: DataFrame, queryDF: DataFrame, groupsToSplit: List[String]): JoinedRDD = {
     val rankedDatabaseDF = databaseDF
       .withColumn("__rank",
         F.when(F.col("key").isin(groupsToSplit),
@@ -164,9 +244,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
 //      joinedRDD.toDF("key", "lhs.from", "lhs.to", "rhs.from", "rhs.to")
   }
 
-  private def runStandardIntervalJoin(databaseDF: DataFrame, queryDF: DataFrame, isSwapped: Boolean): DataFrame = {
-    import databaseDF.sparkSession.implicits._
-
+  private def runStandardIntervalJoin(databaseDF: DataFrame, queryDF: DataFrame): JoinedRDD = {
     val aiLists = databaseDF
       .select("key", "from", "to")
       .repartition(F.col("key"))
@@ -201,30 +279,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
         queries.flatMap(query => aiList.overlapping(query).map(dbRow => (key, dbRow.from, dbRow.to, query.from, query.to)))
       }}
 
-    val initialDFColumnNames = {
-      if (isSwapped)
-        Array("key", "rhs_from", "rhs_to", "lhs_from", "lhs_to")
-      else
-        Array("key", "lhs_from", "lhs_to", "rhs_from", "rhs_to")
-    }
-
-    databaseDF.sparkSession.createDataFrame(
-      joinedRDD
-        .toDF(initialDFColumnNames: _*)
-        .select(
-          F.col("key"),
-          F.struct(
-            F.col("lhs_from").as("from"),
-            F.col("lhs_to").as("to"),
-          ).as("lhs"),
-          F.struct(
-            F.col("rhs_from").as("from"),
-            F.col("rhs_to").as("to"),
-          ).as("rhs")
-        )
-        .rdd,
-      outputSparkSchema
-    )
+    joinedRDD
   }
 
   // -------------------------------------------------------------------------------------------------------------------
