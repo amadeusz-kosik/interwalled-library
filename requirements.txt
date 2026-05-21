@@ -1,4 +1,0 @@
-jupyterlab==4.4.10
-matplotlib==3.10.7
-pandas==2.3.3
-pyarrow==22.0.0
