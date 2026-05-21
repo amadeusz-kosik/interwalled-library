@@ -35,6 +35,10 @@ trait WithDataFrameAssertions extends WithSparkSession { self: Suite =>
     sparkSession.createDataFrame(data.toDF().rdd, schema)
   }
 
+  def createDF(data: DataFrame, schema: StructType)(implicit sparkSession: SparkSession): DataFrame = {
+    sparkSession.createDataFrame(data.rdd, schema)
+  }
+
   def createExpectedDF(database: DataFrame, query: DataFrame)(implicit sparkSession: SparkSession): DataFrame = {
     import sparkSession.implicits._
 
