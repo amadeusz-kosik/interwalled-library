@@ -1,12 +1,14 @@
 package me.kosik.interwalled.spark
 
 import me.kosik.interwalled.ailist.{AIList, AIListBuilder, Configuration, Interval}
-import me.kosik.interwalled.spark.IntervalJoin.{DatabaseQueryChoice, JoinedRDD}
-import org.apache.spark.rdd.RDD
+import me.kosik.interwalled.spark.IntervalJoin.{DatabaseQueryChoice, JoinedDS}
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.types.{DataTypes, StructField, StructType}
-import org.apache.spark.sql.{DataFrame, SparkSession, functions => F}
+import org.apache.spark.sql.{DataFrame, Dataset, SparkSession, functions => F}
 import org.apache.spark.storage.StorageLevel
+
+import scala.collection.mutable.ListBuffer
 
 
 object IntervalJoin {
@@ -29,7 +31,13 @@ object IntervalJoin {
      * Maximum number of rows per group. If both this and @ThresholdBroadcastJoinRowsCount thresholds are exceeded,
      *  the exceeding groups (defined by key column) will be split into smaller ones.
      */
-    thresholdGroupSplit: Long = 1_000_000
+    thresholdGroupSplit: Long = 1_000_000,
+
+    /**
+     * Maximum number of rows per group in query. If a group exceeds this, it will be split on query side and multiplied
+     *  on the database side (salted). This does not apply to broadcast join.
+     */
+    thresholdSaltQuery: Long = 100_000
   )
 
   case class DatabaseQueryChoice(
@@ -40,7 +48,7 @@ object IntervalJoin {
     isSwapped: Boolean
   )
 
-  type JoinedRDD = RDD[(String, Long, Long, Long, Long)]
+  type JoinedDS = Dataset[(String, Long, Long, Long, Long)]
 
   val outputSparkSchema: StructType = StructType(Array(
     StructField("key", DataTypes.StringType, nullable = false),
@@ -53,29 +61,15 @@ object IntervalJoin {
       StructField("to", DataTypes.LongType, nullable = false)
     )), nullable = false)
   ))
-}
 
-class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializable {
-  import IntervalJoin.outputSparkSchema
+  def toDataFrame(joinedDS: JoinedDS): DataFrame = {
+    joinedDS.toDF("key", "lhs_from", "lhs_to", "rhs_from", "rhs_to")
+  }
 
-  // FIXME: this function has no description
-  // FIXME: this function needs logging
-  def join(lhs: DataFrame, rhs: DataFrame)(implicit sparkSession: SparkSession): (String, DataFrame) = {
-    import sparkSession.implicits._
-
-    val databaseQueryChoice = chooseDatabaseAndQuery(lhs, rhs)
-    val (joinMethod, joinedRDD) = selectAndRunIntervalJoinStrategy(databaseQueryChoice)
-
-    val initialDFColumnNames = {
-      if (databaseQueryChoice.isSwapped)
-        Array("key", "rhs_from", "rhs_to", "lhs_from", "lhs_to")
-      else
-        Array("key", "lhs_from", "lhs_to", "rhs_from", "rhs_to")
-    }
-
-    joinMethod -> sparkSession.createDataFrame(
-      joinedRDD
-        .toDF(initialDFColumnNames: _*)
+  def toStrictDataFrame(joinedDS: JoinedDS)(implicit sparkSession: SparkSession): DataFrame = {
+    sparkSession.createDataFrame(
+      joinedDS
+        .toDF("key", "lhs_from", "lhs_to", "rhs_from", "rhs_to")
         .select(
           F.col("key"),
           F.struct(
@@ -90,6 +84,43 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
         .rdd,
       outputSparkSchema
     )
+  }
+}
+
+class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializable with Logging {
+  import IntervalJoin.outputSparkSchema
+
+  // FIXME: this function has no description
+  def join(lhs: DataFrame, rhs: DataFrame)(implicit sparkSession: SparkSession): (List[String], JoinedDS) = {
+    import sparkSession.implicits._
+
+    val eventLog = ListBuffer[String]()
+    val databaseQueryChoice = chooseDatabaseAndQuery(lhs, rhs)
+
+    log.info(s"Database size: ${databaseQueryChoice.databaseCount}, query size: ${databaseQueryChoice.queryCount}.")
+    eventLog.append(s"database_size=${databaseQueryChoice.databaseCount}")
+    eventLog.append(s"query_size=${databaseQueryChoice.queryCount}")
+
+    val (joinMethod, joinedDS) = selectAndRunIntervalJoinStrategy(databaseQueryChoice)
+
+    log.info(s"Chosen join method: $joinMethod.")
+    eventLog.append(s"join_method=$joinMethod")
+
+//    val initialDFColumnNames = {
+//      if (databaseQueryChoice.isSwapped)
+//        Array("key", "rhs_from", "rhs_to", "lhs_from", "lhs_to")
+//      else
+//        Array("key", "lhs_from", "lhs_to", "rhs_from", "rhs_to")
+//    }
+
+    val finalDS = {
+      if (databaseQueryChoice.isSwapped)
+        joinedDS.map { case (key, rhsFrom, rhsTo, lhsFrom, lhsTo) => (key, lhsFrom, lhsTo, rhsFrom, rhsTo) }
+      else
+        joinedDS
+    }
+
+    eventLog.toList -> finalDS
   }
 
   /**
@@ -109,7 +140,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       DatabaseQueryChoice(rhs, rhsSize, lhs, lhsSize, isSwapped = true)
   }
 
-  private def selectAndRunIntervalJoinStrategy(databaseQueryChoice: DatabaseQueryChoice)(implicit sparkSession: SparkSession): (String, JoinedRDD) = {
+  private def selectAndRunIntervalJoinStrategy(databaseQueryChoice: DatabaseQueryChoice)(implicit sparkSession: SparkSession): (String, JoinedDS) = {
     if (databaseQueryChoice.databaseCount <= configuration.thresholdBroadcastJoinRowsCount) {
       "broadcast" -> runBroadcastIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
     } else {
@@ -141,34 +172,32 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
 
   // -------------------------------------------------------------------------------------------------------------------
 
-  private def runBroadcastIntervalJoin(database: DataFrame, query: DataFrame): JoinedRDD = {
-    val sparkSession = database.sparkSession
+  private def runBroadcastIntervalJoin(database: DataFrame, query: DataFrame)(implicit sparkSession: SparkSession): JoinedDS = {
+    import sparkSession.implicits._
 
-    val databaseCollected = database
+    val databaseDS = database
       .select("key", "from", "to")
-      .rdd
-      .groupBy(row => row.getAs[String]("key"))
-      .map { case(key, rows) => key -> rows.map(row => Interval(row.getAs[Long]("from"), row.getAs[Long]("to"))) }
-      .collect()
+      .groupBy("key").agg(F.collect_list(F.struct("from", "to").as("__interval")))
+      .as[(String, List[(Long, Long)])]
 
-    val aiLists: Map[String, Array[AIList]] = databaseCollected
+
+    val aiLists: Map[String, Array[AIList]] = databaseDS
+      .collect()
       .map { case (key, intervals) =>
-        val intervalsIterator = intervals.iterator
+        val intervalsIterator = intervals.map { case (from, to) => Interval(from, to) }.iterator
         key -> AIListBuilder.build(Configuration.apply(), intervalsIterator)
       }
       .toMap
 
-    val aiListsBroadcast = sparkSession.sparkContext.broadcast(aiLists)
+    val aiListsBroadcast = sparkSession.sparkContext
+      .broadcast(aiLists)
 
-    val queryRDD = query
+    val queryDS = query
       .select("key", "from", "to")
-      .rdd
+      .as[(String, Long, Long)]
 
-    val joinedRDD = queryRDD
-      .flatMap { row =>
-        val qKey = row.getAs[String]("key")
-        val qFrom = row.getAs[Long]("from")
-        val qTo = row.getAs[Long]("to")
+    val joinedDS = queryDS
+      .flatMap { case (qKey, qFrom, qTo) =>
 
         aiListsBroadcast.value
           .get(qKey)
@@ -180,10 +209,12 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
           .getOrElse(Array.empty)
       }
 
-    joinedRDD
+    joinedDS
   }
 
-  private def runRankedIntervalJoin(databaseDF: DataFrame, queryDF: DataFrame, groupsToSplit: List[String])(implicit sparkSession: SparkSession): JoinedRDD = {
+  private def runRankedIntervalJoin(databaseDF: DataFrame, queryDF: DataFrame, groupsToSplit: List[String])(implicit sparkSession: SparkSession): JoinedDS = {
+    import sparkSession.implicits._
+
     val rankedDatabaseDF = databaseDF
       .withColumn("__rank",
         F.when(F.col("key").isin(groupsToSplit.toArray: _*),
@@ -200,15 +231,24 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       .collect()
       .map(row => (row.getAs[String]("key"), row.getAs[Int]("__bucket"), row.getAs[Long]("min_from"), row.getAs[Long]("max_to")))
 
-    val ranksBroadcast = sparkSession.sparkContext
-      .broadcast(ranks)
+    val ranksBroadcast = sparkSession.sparkContext.broadcast(ranks)
+    log.info(s"Database ranks: ${ranks.mkString("Array(", ", ", ")")}")
 
-    val databaseRDD = rankedDatabaseDF
+
+    val queryRanks = queryDF
+      .groupBy("key")
+      .agg(F.count("*").as("lookup_count"))
+      .collect()
+      .map(row => (row.getAs[String]("key"), row.getAs[Long]("lookup_count")))
+      .toMap
+
+    val queryRanksBroadcast = sparkSession.sparkContext.broadcast(queryRanks)
+    log.info(s"Query ranks: $queryRanks")
+
+
+    val aiListsDS = rankedDatabaseDF
       .select("key", "__bucket", "from", "to")
       .repartition(F.col("key"), F.col("__bucket"))
-      .rdd
-
-    val aiLists = databaseRDD
       .mapPartitions { dbRowsIterator =>
         val groupedDatabaseData = dbRowsIterator.toArray
           .map(row => (row.getAs[String]("key"), row.getAs[Int]("__bucket")) -> Interval(row.getAs[Long]("from"), row.getAs[Long]("to")))
@@ -221,38 +261,51 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
 
         aiLists.iterator
       }
-
-    val aiListComponents = aiLists
-      .flatMap { case (keys, aiLists) =>
-        aiLists.map(keys -> _)
+      .flatMap { case ((key, bucket), lists) =>
+        lists.map(list => (key, bucket, list))
       }
+      .flatMap { case (key, bucket, list) =>
+        val lookupCount: Long = queryRanksBroadcast.value.getOrElse(key, 1)
+        (0 to (lookupCount / configuration.thresholdSaltQuery).toInt)
+          .toArray
+          .map(salt => (key, bucket, salt, list))
+      }
+      .repartition(F.col("_1"), F.col("_2"), F.col("_3"))
 
-    val queryRDD = queryDF
-      .select("key", "from", "to")
-      .rdd
+    val queryDS = queryDF
+      .join(queryRanks.toList.toDF("key", "lookup_count"), Array("key"))
+      .withColumn("__salt", F.floor(F.rand() * F.col("lookup_count") / F.lit(configuration.thresholdSaltQuery)).cast(DataTypes.IntegerType))
+      .select("key", "__salt", "from", "to") // FIXME
       .flatMap { row =>
         ranksBroadcast
           .value
           .filter { case (key, _, minFrom, maxTo) => row.getAs[String]("key") == key && row.getAs[Long]("from") <= maxTo && row.getAs[Long]("to") >= minFrom }
-          .map { case (key, bucket, _, _) => (key, bucket, row.getAs[Long]("from"), row.getAs[Long]("to"))}
+          .map { case (key, bucket, _, _) => (key, bucket, row.getAs[Int]("__salt"), row.getAs[Long]("from"), row.getAs[Long]("to"))}
       }
-      .groupBy { case (key, bucket, _, _) => (key, bucket) }
+      .toDF("key", "__bucket", "__salt", "from", "to")
+      .repartition(F.col("key"), F.col("__bucket"), F.col("__salt"))
+      .groupBy("key", "__bucket", "__salt")
+      .agg(F.collect_list(F.struct(F.col("from"), F.col("to"))).as("__queries"))
 
 
-    val joinedRDD = aiListComponents
-      .join(queryRDD)
-      .mapPartitions { rows => rows.flatMap { case ((key, bucket), (aiList, queries)) =>
-        queries.flatMap { case (_, _, qFrom, qTo) =>
+    val joinedDS = aiListsDS
+      .joinWith(queryDS, (aiListsDS.col("_1") === queryDS.col("key")) and (aiListsDS.col("_2") === queryDS.col("__bucket")) and (aiListsDS.col("_3") === queryDS.col("__salt")))
+      .as[((String, Int, Int, AIList), (String, Int, Int, List[(Long, Long)]))]
+      .mapPartitions { rows => rows.flatMap { case ((key, _, _, aiList), (_, _, _, queries)) =>
+        queries.flatMap { case (qFrom, qTo) =>
           aiList
             .overlapping(Interval(qFrom, qTo))
             .map(i => (key, i.from, i.to, qFrom, qTo))
         }
       }}
 
-      joinedRDD
+    joinedDS
   }
 
-  private def runStandardIntervalJoin(databaseDF: DataFrame, queryDF: DataFrame): JoinedRDD = {
+  // FIXME: is this really used?
+  private def runStandardIntervalJoin(databaseDF: DataFrame, queryDF: DataFrame): JoinedDS = {
+    import databaseDF.sparkSession.implicits._
+
     val aiLists = databaseDF
       .select("key", "from", "to")
       .repartition(F.col("key"))
@@ -287,7 +340,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
         queries.flatMap(query => aiList.overlapping(query).map(dbRow => (key, dbRow.from, dbRow.to, query.from, query.to)))
       }}
 
-    joinedRDD
+    joinedRDD.toDS()
   }
 
   // -------------------------------------------------------------------------------------------------------------------

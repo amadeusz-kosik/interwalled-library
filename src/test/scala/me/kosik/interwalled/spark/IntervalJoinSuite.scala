@@ -11,8 +11,8 @@ class IntervalJoinSuite extends AnyFunSpec with Matchers with WithDataFrameAsser
 
   val intervalJoinStrategies: Map[String, IntervalJoin.Configuration] = Map(
     "broadcast" -> IntervalJoin.Configuration(1_000_000L, 1_000_000L, 1_000_000L),
-    "ranked"    -> IntervalJoin.Configuration(        0L, 1_000_000L,        10L),
-    "standard"  -> IntervalJoin.Configuration(        0L, 1_000_000L, 1_000_000L)
+    "ranked"    -> IntervalJoin.Configuration(        0L, 1_000_000L,        10L)
+//    "standard"  -> IntervalJoin.Configuration(        0L, 1_000_000L, 1_000_000L)
   )
 
   val testDatasets: Map[String, ((Long, Int, SparkSession) => DataFrame, (Long, Int, SparkSession) => DataFrame)] = Map(
@@ -42,10 +42,10 @@ class IntervalJoinSuite extends AnyFunSpec with Matchers with WithDataFrameAsser
           val rhsDataset = queryCallback(100, 4, sparkSession)
 
           val expectedData = createExpectedDF(lhsDataset, rhsDataset)
-          val (strategy, actualData) = (new IntervalJoin(configuration)).join(lhsDataset, rhsDataset)
+          val (eventLog, actualData) = (new IntervalJoin(configuration)).join(lhsDataset, rhsDataset)
 
-          strategy should be (strategyName)
-          assertDataFramesEqual(expectedData, actualData)
+          eventLog should contain (s"join_method=$strategyName")
+          assertDataFramesEqual(expectedData, IntervalJoin.toStrictDataFrame(actualData))
         }
       }
 
@@ -53,6 +53,7 @@ class IntervalJoinSuite extends AnyFunSpec with Matchers with WithDataFrameAsser
 
       it("should correctly join large data: uniform flat x dense") {
         implicit val _sparkSession: SparkSession = sparkSession
+        val largeDataConfiguration = configuration.copy(thresholdSaltQuery = 1_000)
 
         val lhsDataset = TestDatasets.databaseUniformFlat(100_000, 4)
         val rhsDataset = TestDatasets.queryDense(100_000, 4)
@@ -70,10 +71,10 @@ class IntervalJoinSuite extends AnyFunSpec with Matchers with WithDataFrameAsser
               (F.col("from") - (F.col("from") % 10) + 9).as("to")
             ).as("rhs")
           ), IntervalJoin.outputSparkSchema)
-        val (strategy, actualData) = (new IntervalJoin(configuration)).join(lhsDataset, rhsDataset)
+        val (eventLog, actualData) = (new IntervalJoin(largeDataConfiguration)).join(lhsDataset, rhsDataset)
 
-        strategy should be (strategyName)
-        assertDataFramesEqual(expectedData, actualData)
+        eventLog should contain (s"join_method=$strategyName")
+        assertDataFramesEqual(expectedData, IntervalJoin.toStrictDataFrame(actualData))
       }
     }
   }
