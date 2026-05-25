@@ -12,7 +12,6 @@ class IntervalJoinSuite extends AnyFunSpec with Matchers with WithDataFrameAsser
   val intervalJoinStrategies: Map[String, IntervalJoin.Configuration] = Map(
     "broadcast" -> IntervalJoin.Configuration(1_000_000L, 1_000_000L, 1_000_000L),
     "ranked"    -> IntervalJoin.Configuration(        0L, 1_000_000L,        10L)
-//    "standard"  -> IntervalJoin.Configuration(        0L, 1_000_000L, 1_000_000L)
   )
 
   val testDatasets: Map[String, ((Long, Int, SparkSession) => DataFrame, (Long, Int, SparkSession) => DataFrame)] = Map(

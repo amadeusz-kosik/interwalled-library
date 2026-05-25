@@ -144,29 +144,17 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
     if (databaseQueryChoice.databaseCount <= configuration.thresholdBroadcastJoinRowsCount) {
       "broadcast" -> runBroadcastIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
     } else {
-      val keyCounts = databaseQueryChoice.database
-        .select("key")
-        .distinct()
-        .count()
+      val groupsCounts = databaseQueryChoice.database
+        .groupBy("key")
+        .count().as("rows_count")
+        .collect()
 
-      if (keyCounts <= configuration.thresholdGroupsCount) {
-        val groupsCounts = databaseQueryChoice.database
-          .groupBy("key")
-          .count().as("rows_count")
-          .collect()
+      val groupsToSplit = groupsCounts
+        .filter(r => r.getLong(1) > configuration.thresholdGroupSplit)
+        .map(r => r.getString(0))
+        .toList
 
-        val groupsToSplit = groupsCounts
-          .filter(r => r.getLong(1) > configuration.thresholdGroupSplit)
-          .map(r => r.getString(0))
-          .toList
-
-        if (groupsToSplit.nonEmpty)
-          "ranked" -> runRankedIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query, groupsToSplit)
-        else
-          "standard" -> runStandardIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
-      } else {
-        "standard" -> runStandardIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query)
-      }
+      "ranked" -> runRankedIntervalJoin(databaseQueryChoice.database, databaseQueryChoice.query, groupsToSplit)
     }
   }
 
@@ -275,7 +263,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
     val queryDS = queryDF
       .join(queryRanks.toList.toDF("key", "lookup_count"), Array("key"))
       .withColumn("__salt", F.floor(F.rand() * F.col("lookup_count") / F.lit(configuration.thresholdSaltQuery)).cast(DataTypes.IntegerType))
-      .select("key", "__salt", "from", "to") // FIXME
+      .select("key", "__salt", "from", "to")
       .flatMap { row =>
         ranksBroadcast
           .value
@@ -300,47 +288,6 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       }}
 
     joinedDS
-  }
-
-  // FIXME: is this really used?
-  private def runStandardIntervalJoin(databaseDF: DataFrame, queryDF: DataFrame): JoinedDS = {
-    import databaseDF.sparkSession.implicits._
-
-    val aiLists = databaseDF
-      .select("key", "from", "to")
-      .repartition(F.col("key"))
-      .rdd
-      .mapPartitions { dbRowsIterator =>
-        val groupedDatabaseData = dbRowsIterator.toArray
-          .map(row => row.getAs[String]("key") -> Interval(row.getAs[Long]("from"), row.getAs[Long]("to")))
-          .groupBy { case (key, _) => key }
-          .map { case (key, values) => (key, values.map { case (_, interval) => interval }) }
-
-        val aiLists = groupedDatabaseData.map { case (key, rows) =>
-          key -> AIListBuilder.build(Configuration.apply(), rows)
-        }
-
-        aiLists.iterator
-      }
-
-    val aiListComponents = aiLists
-      .flatMap { case (key, aiLists) =>
-        aiLists.map(key -> _)
-      }
-
-    val queryRDD = queryDF
-      .select("key", "from", "to")
-      .rdd
-      .map(r => r.getAs[String]("key") -> Interval(r.getAs[Long]("from"), r.getAs[Long]("to")))
-      .groupByKey()
-
-    val joinedRDD = aiListComponents
-      .join(queryRDD)
-      .mapPartitions { rows => rows.flatMap { case (key, (aiList, queries)) =>
-        queries.flatMap(query => aiList.overlapping(query).map(dbRow => (key, dbRow.from, dbRow.to, query.from, query.to)))
-      }}
-
-    joinedRDD.toDS()
   }
 
   // -------------------------------------------------------------------------------------------------------------------
