@@ -52,7 +52,7 @@ class IntervalJoinSuite extends AnyFunSpec with Matchers with WithDataFrameAsser
 
       it("should correctly join large data: uniform flat x dense") {
         implicit val _sparkSession: SparkSession = sparkSession
-        val largeDataConfiguration = configuration.copy(thresholdSaltQuery = 1_000)
+        val largeDataConfiguration = configuration.copy(thresholdSaltQuery = 1_000, thresholdDatabaseBatchSize = 10_000)
 
         val lhsDataset = TestDatasets.databaseUniformFlat(100_000, 4)
         val rhsDataset = TestDatasets.queryDense(100_000, 4)
