@@ -23,19 +23,19 @@ val SparkJobAssemblyMergeStrategy: String => sbtassembly.MergeStrategy = {
 
 lazy val root = (project in file("."))
   .settings(
-    name := "interwalled",
+    name := "interwalled-library",
     organization := "me.kosik",
     version := "1.0.0-SNAPSHOT"
   )
 
 
 val ScalaTestVersion = "3.2.20"
-val SparkVersion = "4.1.1"
+val SparkVersion = "4.2.0"
 
 ThisBuild / libraryDependencies += "org.scalatest"      %% "scalatest"    % ScalaTestVersion
 ThisBuild / libraryDependencies += "org.apache.spark"   %% "spark-core"   % SparkVersion      % Provided
 ThisBuild / libraryDependencies += "org.apache.spark"   %% "spark-sql"    % SparkVersion      % Provided
 
 // sbt-assembly
-ThisBuild / assembly / assemblyJarName := f"interwalled-${version.value}.jar"
+ThisBuild / assembly / assemblyJarName := f"interwalled-library-${version.value}.jar"
 ThisBuild / assembly / assemblyMergeStrategy := SparkJobAssemblyMergeStrategy
