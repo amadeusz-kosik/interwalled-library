@@ -187,31 +187,16 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
   private def runRankedIntervalJoin(inputData: DatabaseQueryChoice, eventLog: ListBuffer[String])(implicit sparkSession: SparkSession): JoinedDS = {
     import sparkSession.implicits._
 
-    val databaseDF  = inputData.database
+    val (batchedDatabaseDF, databaseMasterBatches) = addBatchColumn(
+      inputData.database,
+      inputData.databaseCount,
+      configuration.thresholdDatabaseBatchSize,
+      eventLog
+    )
 
-    val databaseMasterBatches = ((inputData.databaseCount - 1) / configuration.thresholdDatabaseBatchSize).toInt + 1
-    eventLog += s"Database batches count: $databaseMasterBatches."
-
-    val batchedDatabaseDF = if(databaseMasterBatches > 1) {
-      databaseDF
-        .withColumn("__hash",   F.hash(F.col("key"), F.col("from"), F.col("to")))
-        .withColumn("__batch",  F.abs(F.col("__hash")) % F.lit(databaseMasterBatches))
-        .persist(StorageLevel.MEMORY_AND_DISK)
-    } else {
-      databaseDF
-        .withColumn("__hash",   F.lit(0))
-        .withColumn("__batch",  F.lit(0))
-    }
-
-    // Prepare queryDS
-    val queryRanks = inputData.query
-      .groupBy("key")
-      .agg(F.count("*").as("lookup_count"))
-      .collect()
-      .map(row => (row.getAs[String]("key"), row.getAs[Long]("lookup_count")))
-      .toMap
-
+    val queryRanks = computeRanks(inputData.query)
     val queryRanksBroadcast = sparkSession.sparkContext.broadcast(queryRanks)
+
     eventLog += s"Query ranks: ${queryRanks.size}"
 
     val queryDS = inputData.query
@@ -224,16 +209,12 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
     val batchedResults = (0 until databaseMasterBatches) map { databaseBatchIndex =>
       val databaseBatchDF = batchedDatabaseDF
         .filter(F.col("__batch") === F.lit(databaseBatchIndex))
-        .drop("__batch", "__hash")
 
-      val groupsCounts = databaseBatchDF
-        .groupBy("key")
-        .count().as("rows_count")
-        .collect()
+      val databaseRanks = computeRanks(databaseBatchDF)
 
-      val groupsToSplit = groupsCounts
-        .filter(r => r.getLong(1) > configuration.thresholdGroupSplit)
-        .map(r => r.getString(0))
+      val groupsToSplit = databaseRanks
+        .filter { case (_, rowsCount) => rowsCount > configuration.thresholdGroupSplit }
+        .keys
         .toList
 
       val rankedDatabaseDF = databaseBatchDF
@@ -314,6 +295,32 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
   }
 
   // -------------------------------------------------------------------------------------------------------------------
+
+  private def addBatchColumn(data: DataFrame, dataRowsCount: Long, threshold: Long, eventLog: ListBuffer[String]): (DataFrame, Int) = {
+    val batchesCount = ((dataRowsCount - 1) / threshold).toInt + 1
+    eventLog += s"Database batches count: $batchesCount."
+
+    val batchedData = if(batchesCount > 1) {
+      data
+        .withColumn("__hash",   F.hash(F.col("key"), F.col("from"), F.col("to")))
+        .withColumn("__batch",  F.abs(F.col("__hash")) % F.lit(batchesCount))
+    } else {
+      data
+        .withColumn("__hash",   F.lit(0))
+        .withColumn("__batch",  F.lit(0))
+    }
+
+    (batchedData, batchesCount)
+  }
+
+  private def computeRanks(data: DataFrame): Map[String, Long] = {
+    data
+      .groupBy("key")
+      .agg(F.count("*").as("__lookup_count"))
+      .collect()
+      .map(row => (row.getAs[String]("key"), row.getAs[Long]("__lookup_count")))
+      .toMap
+  }
 
   private def unionAll[T : Encoder](datasets: List[Dataset[T]])(implicit sparkSession: SparkSession): Dataset[T] = datasets match {
     case Nil =>
