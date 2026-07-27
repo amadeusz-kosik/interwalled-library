@@ -195,7 +195,6 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
     )
 
     val queryGroupsSizes = computeGroupsSizes(inputData.query)
-    val queryGroupsSizesBroadcast = sparkSession.sparkContext.broadcast(queryGroupsSizes)
 
     eventLog += s"Query ranks: ${queryGroupsSizes.size}"
 
@@ -218,31 +217,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       val databaseRanksBroadcast = sparkSession.sparkContext.broadcast(databaseRanks)
       eventLog += s"Database ranks: ${databaseRanks.values.map(_.length).sum}"
 
-      val aiListsDS = rankedDatabaseDF
-        .select("key", "__bucket", "from", "to")
-        .repartition(F.col("key"), F.col("__bucket"))
-        .mapPartitions { dbRowsIterator =>
-          val groupedDatabaseData = dbRowsIterator.toArray
-            .map(row => (row.getAs[String]("key"), row.getAs[Int]("__bucket")) -> Interval(row.getAs[Long]("from"), row.getAs[Long]("to")))
-            .groupBy { case (keys, _) => keys }
-            .map { case (keys, values) => (keys, values.map { case (_, interval) => interval }) }
-
-          val aiLists = groupedDatabaseData.map { case (keys, rows) =>
-            keys -> AIListBuilder.build(Configuration.apply(), rows)
-          }
-
-          aiLists.iterator
-        }
-        .flatMap { case ((key, bucket), lists) =>
-          lists.map(list => (key, bucket, list))
-        }
-        .flatMap { case (key, bucket, list) =>
-          val lookupCount: Long = queryGroupsSizesBroadcast.value.getOrElse(key, 1)
-          (0 to (lookupCount / configuration.thresholdSaltQuery).toInt)
-            .toArray
-            .map(salt => (key, bucket, salt, list))
-        }
-        .repartition(F.col("_1"), F.col("_2"), F.col("_3"))
+      val readyDatabaseDF = prepareRankedDatabase(rankedDatabaseDF, queryGroupsSizes)
 
       val preparedQueryDS = queryDS
         .join(queryGroupsSizes.toList.toDF("key", "lookup_count"), Array("key"))
@@ -260,8 +235,8 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
         .groupBy("key", "__bucket", "__salt")
         .agg(F.collect_list(F.struct(F.col("from"), F.col("to"))).as("__queries"))
 
-      val joinedDS = aiListsDS
-        .joinWith(preparedQueryDS, (aiListsDS.col("_1") === preparedQueryDS.col("key")) and (aiListsDS.col("_2") === preparedQueryDS.col("__bucket")) and (aiListsDS.col("_3") === preparedQueryDS.col("__salt")))
+      val joinedDS = readyDatabaseDF
+        .joinWith(preparedQueryDS, (readyDatabaseDF.col("_1") === preparedQueryDS.col("key")) and (readyDatabaseDF.col("_2") === preparedQueryDS.col("__bucket")) and (readyDatabaseDF.col("_3") === preparedQueryDS.col("__salt")))
         .as[((String, Int, Int, AIList), (String, Int, Int, List[(Long, Long)]))]
         .mapPartitions { rows => rows.flatMap { case ((key, _, _, aiList), (_, _, _, queries)) =>
           queries.flatMap { case (qFrom, qTo) =>
@@ -275,6 +250,53 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
     }
 
     unionAll(batchedResults.toList)
+  }
+
+  // -------------------------------------------------------------------------------------------------------------------
+
+  private def prepareRankedDatabase(rankedDatabaseDF: DataFrame, queryGroupsSizes: Map[String, Long])(implicit sparkSession: SparkSession): DataFrame = {
+    import sparkSession.implicits._
+
+    val queryGroupsSizesBroadcast =
+      sparkSession.sparkContext.broadcast(queryGroupsSizes)
+
+    rankedDatabaseDF
+      .select("key", "__bucket", "from", "to")
+      .repartition(F.col("key"), F.col("__bucket"))
+      .mapPartitions { dbRowsIterator =>
+        val groupedDatabaseData = dbRowsIterator.toArray
+          .map(row => (row.getAs[String]("key"), row.getAs[Int]("__bucket")) -> Interval(row.getAs[Long]("from"), row.getAs[Long]("to")))
+          .groupBy { case (keys, _) => keys }
+          .map { case (keys, values) => (keys, values.map { case (_, interval) => interval }) }
+
+        val aiLists = groupedDatabaseData.map { case (keys, rows) =>
+          keys -> AIListBuilder.build(Configuration.apply(), rows)
+        }
+
+        aiLists.iterator
+      }
+      .flatMap { case ((key, bucket), lists) =>
+        lists.map(list => (key, bucket, list))
+      }
+      .flatMap { case (key, bucket, list) =>
+        val lookupCount: Long = queryGroupsSizesBroadcast.value.getOrElse(key, 1)
+        (0 to (lookupCount / configuration.thresholdSaltQuery).toInt)
+          .toArray
+          .map(salt => (key, bucket, salt, list))
+      }
+      .repartition(F.col("_1"), F.col("_2"), F.col("_3"))
+      .toDF()
+  }
+
+  private def unionAll[T : Encoder](datasets: List[Dataset[T]])(implicit sparkSession: SparkSession): Dataset[T] = datasets match {
+    case Nil =>
+      sparkSession.createDataset(Seq.empty[T])
+
+    case head :: Nil =>
+      head
+
+    case head :: tail =>
+      head.unionByName(unionAll(tail))
   }
 
   // -------------------------------------------------------------------------------------------------------------------
@@ -333,14 +355,4 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       .map { case (key, values) => (key, values.map { case (_, bucket, from, to) => (bucket, from, to)}) }
   }
 
-  private def unionAll[T : Encoder](datasets: List[Dataset[T]])(implicit sparkSession: SparkSession): Dataset[T] = datasets match {
-    case Nil =>
-      sparkSession.createDataset(Seq.empty[T])
-
-    case head :: Nil =>
-      head
-
-    case head :: tail =>
-      head.unionByName(unionAll(tail))
-  }
 }
