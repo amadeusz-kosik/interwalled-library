@@ -187,7 +187,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
   private def runRankedIntervalJoin(inputData: DatabaseQueryChoice, eventLog: ListBuffer[String])(implicit sparkSession: SparkSession): JoinedDS = {
     import sparkSession.implicits._
 
-    val (batchedDatabaseDF, databaseMasterBatches) = addBatchColumn(
+    val (batchedDatabaseDF, databaseMasterBatches) = addHashBatchColumn(
       inputData.database,
       inputData.databaseCount,
       configuration.thresholdDatabaseBatchSize,
@@ -210,30 +210,13 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       val databaseBatchDF = batchedDatabaseDF
         .filter(F.col("__batch") === F.lit(databaseBatchIndex))
 
-      val databaseRanks = computeGroupsSizes(databaseBatchDF)
-
-      val groupsToSplit = databaseRanks
-        .filter { case (_, rowsCount) => rowsCount > configuration.thresholdGroupSplit }
-        .keys.toList
-
-      val rankedDatabaseDF = databaseBatchDF
-        .withColumn("__rank",
-          F.when(F.col("key").isin(groupsToSplit.toArray: _*),
-              F.dense_rank().over(Window.partitionBy("key").orderBy(F.col("from").asc, F.col("to").asc)))
-            .otherwise(F.lit(0))
-        )
-        .withColumn("__bucket", (F.col("__rank") / F.lit(configuration.thresholdGroupSplit)).cast(DataTypes.IntegerType))
-        .drop("__rank")
+      val databaseGroupsSizes = computeGroupsSizes(databaseBatchDF)
+      val rankedDatabaseDF = addRankBatchColumn(databaseBatchDF, databaseGroupsSizes)
         .persist(StorageLevel.MEMORY_AND_DISK)
 
-      val ranks = rankedDatabaseDF
-        .groupBy("key", "__bucket")
-        .agg(F.min("from").as("min_from"), F.max("to").as("max_to"))
-        .collect()
-        .map(row => (row.getAs[String]("key"), row.getAs[Int]("__bucket"), row.getAs[Long]("min_from"), row.getAs[Long]("max_to")))
-
-      val ranksBroadcast = sparkSession.sparkContext.broadcast(ranks)
-      eventLog += s"Database ranks: ${ranks.length}"
+      val databaseRanks = computeRanks(rankedDatabaseDF)
+      val databaseRanksBroadcast = sparkSession.sparkContext.broadcast(databaseRanks)
+      eventLog += s"Database ranks: ${databaseRanks.values.map(_.length).sum}"
 
       val aiListsDS = rankedDatabaseDF
         .select("key", "__bucket", "from", "to")
@@ -266,10 +249,11 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
         .withColumn("__salt", F.floor(F.rand() * F.col("lookup_count") / F.lit(configuration.thresholdSaltQuery)).cast(DataTypes.IntegerType))
         .select("key", "__salt", "from", "to")
         .flatMap { row =>
-          ranksBroadcast
+          databaseRanksBroadcast
             .value
-            .filter { case (key, _, minFrom, maxTo) => row.getAs[String]("key") == key && row.getAs[Long]("from") <= maxTo && row.getAs[Long]("to") >= minFrom }
-            .map { case (key, bucket, _, _) => (key, bucket, row.getAs[Int]("__salt"), row.getAs[Long]("from"), row.getAs[Long]("to"))}
+            .getOrElse(row.getAs[String]("key"), Array.empty[(Int, Long, Long)])
+            .filter { case (_, minFrom, maxTo) => row.getAs[Long]("from") <= maxTo && row.getAs[Long]("to") >= minFrom }
+            .map { case (bucket, _, _) => (row.getAs[String]("key"), bucket, row.getAs[Int]("__salt"), row.getAs[Long]("from"), row.getAs[Long]("to"))}
         }
         .toDF("key", "__bucket", "__salt", "from", "to")
         .repartition(F.col("key"), F.col("__bucket"), F.col("__salt"))
@@ -295,7 +279,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
 
   // -------------------------------------------------------------------------------------------------------------------
 
-  private def addBatchColumn(data: DataFrame, dataRowsCount: Long, threshold: Long, eventLog: ListBuffer[String]): (DataFrame, Int) = {
+  private def addHashBatchColumn(data: DataFrame, dataRowsCount: Long, threshold: Long, eventLog: ListBuffer[String]): (DataFrame, Int) = {
     val batchesCount = ((dataRowsCount - 1) / threshold).toInt + 1
     eventLog += s"Database batches count: $batchesCount."
 
@@ -312,6 +296,24 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
     (batchedData, batchesCount)
   }
 
+  private def addRankBatchColumn(data: DataFrame, groupSizes: Map[String, Long]): DataFrame = {
+    val groupsToSplit = groupSizes
+      .filter { case (_, rowsCount) => rowsCount > configuration.thresholdGroupSplit }
+      .keys.toList
+
+    val rankedDF = data
+      .withColumn("__rank",
+        F
+          .when(F.col("key").isin(groupsToSplit.toArray: _*),
+            F.dense_rank().over(Window.partitionBy("key").orderBy(F.col("from").asc, F.col("to").asc)))
+          .otherwise(F.lit(0))
+      )
+      .withColumn("__bucket", (F.col("__rank") / F.lit(configuration.thresholdGroupSplit)).cast(DataTypes.IntegerType))
+      .drop("__rank")
+
+    rankedDF
+  }
+
   private def computeGroupsSizes(data: DataFrame): Map[String, Long] = {
     data
       .groupBy("key")
@@ -319,6 +321,16 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       .collect()
       .map(row => (row.getAs[String]("key"), row.getAs[Long]("__lookup_count")))
       .toMap
+  }
+
+  private def computeRanks(rankedData: DataFrame): Map[String, Array[(Int, Long, Long)]] = {
+    rankedData
+      .groupBy("key", "__bucket")
+      .agg(F.min("from").as("min_from"), F.max("to").as("max_to"))
+      .collect()
+      .map(row => (row.getAs[String]("key"), row.getAs[Int]("__bucket"), row.getAs[Long]("min_from"), row.getAs[Long]("max_to")))
+      .groupBy { case (key, _, _, _) => key }
+      .map { case (key, values) => (key, values.map { case (_, bucket, from, to) => (bucket, from, to)}) }
   }
 
   private def unionAll[T : Encoder](datasets: List[Dataset[T]])(implicit sparkSession: SparkSession): Dataset[T] = datasets match {
