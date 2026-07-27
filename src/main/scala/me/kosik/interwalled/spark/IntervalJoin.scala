@@ -194,13 +194,13 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       eventLog
     )
 
-    val queryRanks = computeRanks(inputData.query)
-    val queryRanksBroadcast = sparkSession.sparkContext.broadcast(queryRanks)
+    val queryGroupsSizes = computeGroupsSizes(inputData.query)
+    val queryGroupsSizesBroadcast = sparkSession.sparkContext.broadcast(queryGroupsSizes)
 
-    eventLog += s"Query ranks: ${queryRanks.size}"
+    eventLog += s"Query ranks: ${queryGroupsSizes.size}"
 
     val queryDS = inputData.query
-      .join(queryRanks.toList.toDF("key", "lookup_count"), Array("key"))
+      .join(queryGroupsSizes.toList.toDF("key", "lookup_count"), Array("key"))
       .withColumn("__salt", F.floor(F.rand() * F.col("lookup_count") / F.lit(configuration.thresholdSaltQuery)).cast(DataTypes.IntegerType))
       .select("key", "__salt", "from", "to")
       .cache()
@@ -210,12 +210,11 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       val databaseBatchDF = batchedDatabaseDF
         .filter(F.col("__batch") === F.lit(databaseBatchIndex))
 
-      val databaseRanks = computeRanks(databaseBatchDF)
+      val databaseRanks = computeGroupsSizes(databaseBatchDF)
 
       val groupsToSplit = databaseRanks
         .filter { case (_, rowsCount) => rowsCount > configuration.thresholdGroupSplit }
-        .keys
-        .toList
+        .keys.toList
 
       val rankedDatabaseDF = databaseBatchDF
         .withColumn("__rank",
@@ -255,7 +254,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
           lists.map(list => (key, bucket, list))
         }
         .flatMap { case (key, bucket, list) =>
-          val lookupCount: Long = queryRanksBroadcast.value.getOrElse(key, 1)
+          val lookupCount: Long = queryGroupsSizesBroadcast.value.getOrElse(key, 1)
           (0 to (lookupCount / configuration.thresholdSaltQuery).toInt)
             .toArray
             .map(salt => (key, bucket, salt, list))
@@ -263,7 +262,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
         .repartition(F.col("_1"), F.col("_2"), F.col("_3"))
 
       val preparedQueryDS = queryDS
-        .join(queryRanks.toList.toDF("key", "lookup_count"), Array("key"))
+        .join(queryGroupsSizes.toList.toDF("key", "lookup_count"), Array("key"))
         .withColumn("__salt", F.floor(F.rand() * F.col("lookup_count") / F.lit(configuration.thresholdSaltQuery)).cast(DataTypes.IntegerType))
         .select("key", "__salt", "from", "to")
         .flatMap { row =>
@@ -313,7 +312,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
     (batchedData, batchesCount)
   }
 
-  private def computeRanks(data: DataFrame): Map[String, Long] = {
+  private def computeGroupsSizes(data: DataFrame): Map[String, Long] = {
     data
       .groupBy("key")
       .agg(F.count("*").as("__lookup_count"))
