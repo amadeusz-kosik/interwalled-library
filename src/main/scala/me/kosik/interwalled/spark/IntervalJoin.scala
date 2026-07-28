@@ -8,6 +8,7 @@ import org.apache.spark.sql.types.{DataTypes, StructField, StructType}
 import org.apache.spark.sql.{DataFrame, Dataset, Encoder, SparkSession, functions => F}
 import org.apache.spark.storage.StorageLevel
 
+import scala.annotation.tailrec
 import scala.collection.mutable.ListBuffer
 
 
@@ -297,6 +298,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       .agg(F.collect_list(F.struct(F.col("from"), F.col("to"))).as("__queries"))
   }
 
+  @tailrec
   private def unionAll[T : Encoder](datasets: List[Dataset[T]])(implicit sparkSession: SparkSession): Dataset[T] = datasets match {
     case Nil =>
       sparkSession.createDataset(Seq.empty[T])
@@ -304,8 +306,8 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
     case head :: Nil =>
       head
 
-    case head :: tail =>
-      head.unionByName(unionAll(tail))
+    case head :: tail :: others =>
+      unionAll(head.unionByName(tail) :: others)
   }
 
   // -------------------------------------------------------------------------------------------------------------------
