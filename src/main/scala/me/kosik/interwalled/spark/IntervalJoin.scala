@@ -68,10 +68,6 @@ object IntervalJoin {
     )), nullable = false)
   ))
 
-  def toDataFrame(joinedDS: JoinedDS): DataFrame = {
-    joinedDS.toDF("key", "lhs_from", "lhs_to", "rhs_from", "rhs_to")
-  }
-
   def toStrictDataFrame(joinedDS: JoinedDS)(implicit sparkSession: SparkSession): DataFrame = {
     sparkSession.createDataFrame(
       joinedDS
@@ -94,6 +90,7 @@ object IntervalJoin {
 }
 
 class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializable with Logging {
+
   // FIXME: this function has no description
   def join(lhs: DataFrame, rhs: DataFrame)(implicit sparkSession: SparkSession): (List[String], JoinedDS) = {
     import sparkSession.implicits._
@@ -188,35 +185,56 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
   private def runRankedIntervalJoin(inputData: DatabaseQueryChoice, eventLog: ListBuffer[String])(implicit sparkSession: SparkSession): JoinedDS = {
     import sparkSession.implicits._
 
-    val (batchedDatabaseDF, databaseMasterBatches) = addHashBatchColumn(
-      inputData.database,
-      inputData.databaseCount,
-      configuration.thresholdDatabaseBatchSize,
-      eventLog
-    )
+    /* Database batches:
+       Split database (smaller input dataset) into batches of at most ${configuration.thresholdDatabaseBatchSize} size.
+       Rows are assigned to batches at random, by result of hash function (built-in hash function from Apache Spark).
+     */
+    val databaseBatchesCount = ((inputData.databaseCount - 1) / configuration.thresholdDatabaseBatchSize).toInt + 1
+    eventLog += s"Database batches count: $databaseBatchesCount."
 
+    /* Query groups sizes:
+       Count all rows in query (larger input datasets) dataset per key. Return dictionary of key -> rows count.
+     */
     val queryGroupsSizes = computeGroupsSizes(inputData.query)
     eventLog += s"Query ranks: ${queryGroupsSizes.size}"
 
-    val fullQueryDF = prepareFullQuery(inputData.query, queryGroupsSizes)
+    val fullDatabaseDF =
+      prepareFullDatabase(inputData.database, databaseBatchesCount).cache()
 
-    // Split database into batches
-    val batchedResults = (0 until databaseMasterBatches) map { databaseBatchIndex =>
-      val databaseBatchDF = batchedDatabaseDF
+    val fullQueryDF =
+      prepareFullQuery(inputData.query, queryGroupsSizes).cache()
+
+    // Split database into batches, union all batches at the end of the computation.
+    val batchedResults = (0 until databaseBatchesCount) map { databaseBatchIndex =>
+      val databaseBatchDF = fullDatabaseDF
         .filter(F.col("__batch") === F.lit(databaseBatchIndex))
 
-      val databaseGroupsSizes = computeGroupsSizes(databaseBatchDF)
-      val rankedDatabaseDF = addRankBatchColumn(databaseBatchDF, databaseGroupsSizes)
-        .persist(StorageLevel.MEMORY_AND_DISK)
+      /* Database groups sizes:
+         See _Query groups sizes_. Return dictionary of key -> rows count.
+      */
+      val databaseGroupsSizes =
+        computeGroupsSizes(databaseBatchDF)
 
-      val databaseRanks = computeRanks(rankedDatabaseDF)
+      /* Ranked database:
+         On per key basis, split each set of rows into max of ${configuration.thresholdGroupSplit}. Split is done on
+         sorted rows, not at random.
+         The databaseRanks contains stats for each (key, rank) tuple: MIN(from) and MAX(to) values
+         for better interval pruning.
+       */
+      val rankedDatabaseDF =
+        addRankBatchColumn(databaseBatchDF, databaseGroupsSizes)
+      val databaseRanks =
+        computeRanks(rankedDatabaseDF)
+
       eventLog += s"Database ranks: ${databaseRanks.values.map(_.length).sum}"
 
-      val readyDatabaseDF = prepareRankedDatabase(rankedDatabaseDF, queryGroupsSizes)
-      val readyQueryDF = prepareRankedQuery(fullQueryDF, databaseRanks)
+      val readyDatabaseDF =
+        prepareRankedDatabase(rankedDatabaseDF, queryGroupsSizes)
+      val readyQueryDF =
+        prepareRankedQuery(fullQueryDF, databaseRanks)
 
       val joinedDS = readyDatabaseDF
-        .joinWith(readyQueryDF, (readyDatabaseDF.col("_1") === readyQueryDF.col("key")) and (readyDatabaseDF.col("_2") === readyQueryDF.col("__bucket")) and (readyDatabaseDF.col("_3") === readyQueryDF.col("__salt")))
+        .joinWith(readyQueryDF, (readyDatabaseDF.col("key") === readyQueryDF.col("key")) and (readyDatabaseDF.col("__bucket") === readyQueryDF.col("__bucket")) and (readyDatabaseDF.col("__salt") === readyQueryDF.col("__salt")))
         .as[((String, Int, Int, AIList), (String, Int, Int, List[(Long, Long)]))]
         .mapPartitions { rows => rows.flatMap { case ((key, _, _, aiList), (_, _, _, queries)) =>
           queries.flatMap { case (qFrom, qTo) =>
@@ -233,6 +251,27 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
   }
 
   // -------------------------------------------------------------------------------------------------------------------
+
+  private def prepareFullDatabase(inputDatabaseDF: DataFrame, batchesCount: Int): DataFrame = {
+    if(batchesCount > 1) {
+      inputDatabaseDF
+        .withColumn("__hash",   F.hash(F.col("key"), F.col("from"), F.col("to")))
+        .withColumn("__batch",  F.abs(F.col("__hash")) % F.lit(batchesCount))
+    } else {
+      inputDatabaseDF
+        .withColumn("__hash",   F.lit(0))
+        .withColumn("__batch",  F.lit(0))
+    }
+  }
+
+  private def prepareFullQuery(inputQueryDF: DataFrame, queryGroupsSizes: Map[String, Long]): DataFrame = {
+    import inputQueryDF.sparkSession.implicits._
+
+    inputQueryDF
+      .join(queryGroupsSizes.toList.toDF("key", "lookup_count"), Array("key"))
+      .withColumn("__salt", F.floor(F.rand() * F.col("lookup_count") / F.lit(configuration.thresholdSaltQuery)).cast(DataTypes.IntegerType))
+      .select("key", "__salt", "from", "to")
+  }
 
   private def prepareRankedDatabase(rankedDatabaseDF: DataFrame, queryGroupsSizes: Map[String, Long])(implicit sparkSession: SparkSession): DataFrame = {
     import sparkSession.implicits._
@@ -264,25 +303,15 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
           .toArray
           .map(salt => (key, bucket, salt, list))
       }
-      .repartition(F.col("_1"), F.col("_2"), F.col("_3"))
-      .toDF()
+      .toDF("key", "__bucket", "__salt", "ailist")
   }
 
-  private def prepareFullQuery(inputQueryDF: DataFrame, queryGroupsSizes: Map[String, Long])(implicit sparkSession: SparkSession): DataFrame = {
-    import sparkSession.implicits._
 
-    inputQueryDF
-      .join(queryGroupsSizes.toList.toDF("key", "lookup_count"), Array("key"))
-      .withColumn("__salt", F.floor(F.rand() * F.col("lookup_count") / F.lit(configuration.thresholdSaltQuery)).cast(DataTypes.IntegerType))
-      .select("key", "__salt", "from", "to")
-      .cache()
-  }
-
-  private def prepareRankedQuery(fullQueryDF: DataFrame, databaseRanks: Map[String, Array[(Int, Long, Long)]])(implicit sparkSession: SparkSession): DataFrame = {
-    import sparkSession.implicits._
+  private def prepareRankedQuery(fullQueryDF: DataFrame, databaseRanks: Map[String, Array[(Int, Long, Long)]]): DataFrame = {
+    import fullQueryDF.sparkSession.implicits._
 
     val databaseRanksBroadcast =
-      sparkSession.sparkContext.broadcast(databaseRanks)
+      fullQueryDF.sparkSession.sparkContext.broadcast(databaseRanks)
 
     fullQueryDF
       .flatMap { row =>
@@ -293,7 +322,6 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
           .map { case (bucket, _, _) => (row.getAs[String]("key"), bucket, row.getAs[Int]("__salt"), row.getAs[Long]("from"), row.getAs[Long]("to"))}
       }
       .toDF("key", "__bucket", "__salt", "from", "to")
-      .repartition(F.col("key"), F.col("__bucket"), F.col("__salt"))
       .groupBy("key", "__bucket", "__salt")
       .agg(F.collect_list(F.struct(F.col("from"), F.col("to"))).as("__queries"))
   }
@@ -311,23 +339,6 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
   }
 
   // -------------------------------------------------------------------------------------------------------------------
-
-  private def addHashBatchColumn(data: DataFrame, dataRowsCount: Long, threshold: Long, eventLog: ListBuffer[String]): (DataFrame, Int) = {
-    val batchesCount = ((dataRowsCount - 1) / threshold).toInt + 1
-    eventLog += s"Database batches count: $batchesCount."
-
-    val batchedData = if(batchesCount > 1) {
-      data
-        .withColumn("__hash",   F.hash(F.col("key"), F.col("from"), F.col("to")))
-        .withColumn("__batch",  F.abs(F.col("__hash")) % F.lit(batchesCount))
-    } else {
-      data
-        .withColumn("__hash",   F.lit(0))
-        .withColumn("__batch",  F.lit(0))
-    }
-
-    (batchedData, batchesCount)
-  }
 
   private def addRankBatchColumn(data: DataFrame, groupSizes: Map[String, Long]): DataFrame = {
     val groupsToSplit = groupSizes
