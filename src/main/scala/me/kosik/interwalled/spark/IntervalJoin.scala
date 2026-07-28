@@ -195,7 +195,6 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
     )
 
     val queryGroupsSizes = computeGroupsSizes(inputData.query)
-
     eventLog += s"Query ranks: ${queryGroupsSizes.size}"
 
     val queryDS = inputData.query
@@ -214,29 +213,13 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
         .persist(StorageLevel.MEMORY_AND_DISK)
 
       val databaseRanks = computeRanks(rankedDatabaseDF)
-      val databaseRanksBroadcast = sparkSession.sparkContext.broadcast(databaseRanks)
       eventLog += s"Database ranks: ${databaseRanks.values.map(_.length).sum}"
 
       val readyDatabaseDF = prepareRankedDatabase(rankedDatabaseDF, queryGroupsSizes)
-
-      val preparedQueryDS = queryDS
-        .join(queryGroupsSizes.toList.toDF("key", "lookup_count"), Array("key"))
-        .withColumn("__salt", F.floor(F.rand() * F.col("lookup_count") / F.lit(configuration.thresholdSaltQuery)).cast(DataTypes.IntegerType))
-        .select("key", "__salt", "from", "to")
-        .flatMap { row =>
-          databaseRanksBroadcast
-            .value
-            .getOrElse(row.getAs[String]("key"), Array.empty[(Int, Long, Long)])
-            .filter { case (_, minFrom, maxTo) => row.getAs[Long]("from") <= maxTo && row.getAs[Long]("to") >= minFrom }
-            .map { case (bucket, _, _) => (row.getAs[String]("key"), bucket, row.getAs[Int]("__salt"), row.getAs[Long]("from"), row.getAs[Long]("to"))}
-        }
-        .toDF("key", "__bucket", "__salt", "from", "to")
-        .repartition(F.col("key"), F.col("__bucket"), F.col("__salt"))
-        .groupBy("key", "__bucket", "__salt")
-        .agg(F.collect_list(F.struct(F.col("from"), F.col("to"))).as("__queries"))
+      val readyQueryDF = prepareRankedQuery(queryDS, queryGroupsSizes, databaseRanks)
 
       val joinedDS = readyDatabaseDF
-        .joinWith(preparedQueryDS, (readyDatabaseDF.col("_1") === preparedQueryDS.col("key")) and (readyDatabaseDF.col("_2") === preparedQueryDS.col("__bucket")) and (readyDatabaseDF.col("_3") === preparedQueryDS.col("__salt")))
+        .joinWith(readyQueryDF, (readyDatabaseDF.col("_1") === readyQueryDF.col("key")) and (readyDatabaseDF.col("_2") === readyQueryDF.col("__bucket")) and (readyDatabaseDF.col("_3") === readyQueryDF.col("__salt")))
         .as[((String, Int, Int, AIList), (String, Int, Int, List[(Long, Long)]))]
         .mapPartitions { rows => rows.flatMap { case ((key, _, _, aiList), (_, _, _, queries)) =>
           queries.flatMap { case (qFrom, qTo) =>
@@ -286,6 +269,28 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       }
       .repartition(F.col("_1"), F.col("_2"), F.col("_3"))
       .toDF()
+  }
+
+  private def prepareRankedQuery(queryDS: DataFrame, queryGroupsSizes: Map[String, Long], databaseRanks: Map[String, Array[(Int, Long, Long)]])(implicit sparkSession: SparkSession): DataFrame = {
+    import sparkSession.implicits._
+
+    val databaseRanksBroadcast = sparkSession.sparkContext.broadcast(databaseRanks)
+
+    queryDS
+      .join(queryGroupsSizes.toList.toDF("key", "lookup_count"), Array("key"))
+      .withColumn("__salt", F.floor(F.rand() * F.col("lookup_count") / F.lit(configuration.thresholdSaltQuery)).cast(DataTypes.IntegerType))
+      .select("key", "__salt", "from", "to")
+      .flatMap { row =>
+        databaseRanksBroadcast
+          .value
+          .getOrElse(row.getAs[String]("key"), Array.empty[(Int, Long, Long)])
+          .filter { case (_, minFrom, maxTo) => row.getAs[Long]("from") <= maxTo && row.getAs[Long]("to") >= minFrom }
+          .map { case (bucket, _, _) => (row.getAs[String]("key"), bucket, row.getAs[Int]("__salt"), row.getAs[Long]("from"), row.getAs[Long]("to"))}
+      }
+      .toDF("key", "__bucket", "__salt", "from", "to")
+      .repartition(F.col("key"), F.col("__bucket"), F.col("__salt"))
+      .groupBy("key", "__bucket", "__salt")
+      .agg(F.collect_list(F.struct(F.col("from"), F.col("to"))).as("__queries"))
   }
 
   private def unionAll[T : Encoder](datasets: List[Dataset[T]])(implicit sparkSession: SparkSession): Dataset[T] = datasets match {
