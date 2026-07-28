@@ -5,7 +5,7 @@ import me.kosik.interwalled.spark.IntervalJoin.{DatabaseQueryChoice, JoinedDS}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.types.{DataTypes, StructField, StructType}
-import org.apache.spark.sql.{DataFrame, Dataset, Encoder, SparkSession, functions => F}
+import org.apache.spark.sql.{Column, DataFrame, Dataset, Encoder, SparkSession, functions => F}
 import org.apache.spark.storage.StorageLevel
 
 import scala.annotation.tailrec
@@ -234,7 +234,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
         prepareRankedQuery(fullQueryDF, databaseRanks)
 
       val joinedDS = readyDatabaseDF
-        .joinWith(readyQueryDF, (readyDatabaseDF.col("key") === readyQueryDF.col("key")) and (readyDatabaseDF.col("__bucket") === readyQueryDF.col("__bucket")) and (readyDatabaseDF.col("__salt") === readyQueryDF.col("__salt")))
+        .joinWith(readyQueryDF, allPredicate(readyDatabaseDF, readyQueryDF, List("key", "__bucket", "__salt")))
         .as[((String, Int, Int, AIList), (String, Int, Int, List[(Long, Long)]))]
         .mapPartitions { rows => rows.flatMap { case ((key, _, _, aiList), (_, _, _, queries)) =>
           queries.flatMap { case (qFrom, qTo) =>
@@ -306,7 +306,6 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       .toDF("key", "__bucket", "__salt", "ailist")
   }
 
-
   private def prepareRankedQuery(fullQueryDF: DataFrame, databaseRanks: Map[String, Array[(Int, Long, Long)]]): DataFrame = {
     import fullQueryDF.sparkSession.implicits._
 
@@ -325,6 +324,15 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       .groupBy("key", "__bucket", "__salt")
       .agg(F.collect_list(F.struct(F.col("from"), F.col("to"))).as("__queries"))
   }
+
+  private def allPredicate(lhs: DataFrame, rhs: DataFrame, columns: List[String]): Column = {
+    assert(columns.nonEmpty, "Cannot compute all predicate on empty set of columns.")
+
+    columns
+      .map { columnName => lhs.col(columnName) === rhs.col(columnName) }
+      .reduce(_ and _)
+  }
+
 
   @tailrec
   private def unionAll[T : Encoder](datasets: List[Dataset[T]])(implicit sparkSession: SparkSession): Dataset[T] = datasets match {
