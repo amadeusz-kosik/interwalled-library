@@ -197,11 +197,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
     val queryGroupsSizes = computeGroupsSizes(inputData.query)
     eventLog += s"Query ranks: ${queryGroupsSizes.size}"
 
-    val queryDS = inputData.query
-      .join(queryGroupsSizes.toList.toDF("key", "lookup_count"), Array("key"))
-      .withColumn("__salt", F.floor(F.rand() * F.col("lookup_count") / F.lit(configuration.thresholdSaltQuery)).cast(DataTypes.IntegerType))
-      .select("key", "__salt", "from", "to")
-      .cache()
+    val fullQueryDF = prepareFullQuery(inputData.query, queryGroupsSizes)
 
     // Split database into batches
     val batchedResults = (0 until databaseMasterBatches) map { databaseBatchIndex =>
@@ -216,7 +212,7 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       eventLog += s"Database ranks: ${databaseRanks.values.map(_.length).sum}"
 
       val readyDatabaseDF = prepareRankedDatabase(rankedDatabaseDF, queryGroupsSizes)
-      val readyQueryDF = prepareRankedQuery(queryDS, queryGroupsSizes, databaseRanks)
+      val readyQueryDF = prepareRankedQuery(fullQueryDF, databaseRanks)
 
       val joinedDS = readyDatabaseDF
         .joinWith(readyQueryDF, (readyDatabaseDF.col("_1") === readyQueryDF.col("key")) and (readyDatabaseDF.col("_2") === readyQueryDF.col("__bucket")) and (readyDatabaseDF.col("_3") === readyQueryDF.col("__salt")))
@@ -271,15 +267,23 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
       .toDF()
   }
 
-  private def prepareRankedQuery(queryDS: DataFrame, queryGroupsSizes: Map[String, Long], databaseRanks: Map[String, Array[(Int, Long, Long)]])(implicit sparkSession: SparkSession): DataFrame = {
+  private def prepareFullQuery(inputQueryDF: DataFrame, queryGroupsSizes: Map[String, Long])(implicit sparkSession: SparkSession): DataFrame = {
     import sparkSession.implicits._
 
-    val databaseRanksBroadcast = sparkSession.sparkContext.broadcast(databaseRanks)
-
-    queryDS
+    inputQueryDF
       .join(queryGroupsSizes.toList.toDF("key", "lookup_count"), Array("key"))
       .withColumn("__salt", F.floor(F.rand() * F.col("lookup_count") / F.lit(configuration.thresholdSaltQuery)).cast(DataTypes.IntegerType))
       .select("key", "__salt", "from", "to")
+      .cache()
+  }
+
+  private def prepareRankedQuery(fullQueryDF: DataFrame, databaseRanks: Map[String, Array[(Int, Long, Long)]])(implicit sparkSession: SparkSession): DataFrame = {
+    import sparkSession.implicits._
+
+    val databaseRanksBroadcast =
+      sparkSession.sparkContext.broadcast(databaseRanks)
+
+    fullQueryDF
       .flatMap { row =>
         databaseRanksBroadcast
           .value
