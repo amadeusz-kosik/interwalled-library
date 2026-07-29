@@ -185,26 +185,36 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
   private def runRankedIntervalJoin(inputData: DatabaseQueryChoice, eventLog: ListBuffer[String])(implicit sparkSession: SparkSession): JoinedDS = {
     import sparkSession.implicits._
 
-    /* Database batches:
-       Split database (smaller input dataset) into batches of at most ${configuration.thresholdDatabaseBatchSize} size.
-       Rows are assigned to batches at random, by result of hash function (built-in hash function from Apache Spark).
+    /* Database batches count:
+       Compute the number of batches to split the database into.
+       Each batch is at most ${configuration.thresholdDatabaseBatchSize} rows in total. Rows are assigned to batches
+       at random, by the result of a hash function (built-in hash function from Apache Spark).
      */
     val databaseBatchesCount = ((inputData.databaseCount - 1) / configuration.thresholdDatabaseBatchSize).toInt + 1
     eventLog += s"Database batches count: $databaseBatchesCount."
 
     /* Query groups sizes:
-       Count all rows in query (larger input datasets) dataset per key. Return dictionary of key -> rows count.
+       Count all rows in the query (larger input datasets) dataset per key. Return dictionary of key -> rows count.
      */
     val queryGroupsSizes = computeGroupsSizes(inputData.query)
     eventLog += s"Query ranks: ${queryGroupsSizes.size}"
 
+    /* Database batches:
+       Add `__batch` column containing batch id assigned as described above.
+     */
     val fullDatabaseDF =
       prepareFullDatabase(inputData.database, databaseBatchesCount).cache()
 
+    /* Query:
+       Add `__salt` column, representing salt: random integer value from [0, (group count / salt threshold)).
+       Large groups are split on the query side and duplicated on the database one.
+     */
     val fullQueryDF =
       prepareFullQuery(inputData.query, queryGroupsSizes).cache()
 
-    // Split database into batches, union all batches at the end of the computation.
+    /* Batches loop:
+       Compute each database batch and union them all at the end.
+     */
     val batchedResults = (0 until databaseBatchesCount) map { databaseBatchIndex =>
       val databaseBatchDF = fullDatabaseDF
         .filter(F.col("__batch") === F.lit(databaseBatchIndex))
@@ -216,23 +226,41 @@ class IntervalJoin(configuration: IntervalJoin.Configuration) extends Serializab
         computeGroupsSizes(databaseBatchDF)
 
       /* Ranked database:
-         On per key basis, split each set of rows into max of ${configuration.thresholdGroupSplit}. Split is done on
-         sorted rows, not at random.
-         The databaseRanks contains stats for each (key, rank) tuple: MIN(from) and MAX(to) values
+         On a per-key basis, split each set of rows into max of ${configuration.thresholdGroupSplit}. Split is done
+         after sorting rows, not at random.
+         The databaseRanks variable contains stats for each (key, rank) tuple: MIN(from) and MAX(to) values
          for better interval pruning.
        */
       val rankedDatabaseDF =
         addRankBatchColumn(databaseBatchDF, databaseGroupsSizes)
-      val databaseRanks =
+      val databaseRanks: Map[String, Array[(Int, Long, Long)]] =
         computeRanks(rankedDatabaseDF)
-
       eventLog += s"Database ranks: ${databaseRanks.values.map(_.length).sum}"
 
+      /* AILists:
+         Create AILists from the database:
+         - repartition the data by bucket and key,
+         - create the AILists on per-partition basis,
+         - flatten the structure so each row contains only one AIList instance,
+         - duplicate rows for salting (done on the query side).
+       */
       val readyDatabaseDF =
         prepareRankedDatabase(rankedDatabaseDF, queryGroupsSizes)
+
+      /* Queries:
+         Prepare query rows for joining:
+         - remove rows that would not join on anything from the database based on `databaseRanks`,
+         - group query rows per bucket and key.
+       */
       val readyQueryDF =
         prepareRankedQuery(fullQueryDF, databaseRanks)
 
+      /* Join
+         Perform the join itself:
+         - cogroup rows based on key, bucket and salt,
+         - run AIList overlapping on each partition,
+         - flatten the results.
+       */
       val joinedDS = readyDatabaseDF
         .joinWith(readyQueryDF, allPredicate(readyDatabaseDF, readyQueryDF, List("key", "__bucket", "__salt")))
         .as[((String, Int, Int, AIList), (String, Int, Int, List[(Long, Long)]))]
